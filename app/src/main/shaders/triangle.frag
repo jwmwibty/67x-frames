@@ -51,7 +51,7 @@ float sceneMap(vec3 p, out int materialId) {
 vec3 sceneNormal(vec3 p) {
     const float e = 0.0025;
     int unusedMaterial;
-    vec2 k = vec2(1.0, -1.0);
+    vec3 k = vec3(1.0, -1.0, 0.0);
     return normalize(
         k.xyy * sceneMap(p + k.xyy * e, unusedMaterial) +
         k.yyx * sceneMap(p + k.yyx * e, unusedMaterial) +
