@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -19,8 +20,10 @@ public:
     std::string start(
             JNIEnv* env,
             jobject surfaceObject,
-            jobject assetManagerObject) {
+            jobject assetManagerObject,
+            bool halfResolution) {
         stop();
+        halfResolution_ = halfResolution;
 
         window_ = ANativeWindow_fromSurface(env, surfaceObject);
         if (window_ == nullptr) {
@@ -75,7 +78,7 @@ public:
         if (!createGraphicsPipeline(assetManager)) return abortStart(status_);
         if (!createFrameResources()) return abortStart(status_);
 
-        status_ = "READY\n67xFrames — Vulkan triangle renderer\n";
+        status_ = "READY\n67xFrames — procedural Vulkan scene\n";
         status_ += "GPU: ";
         status_ += properties_.deviceName;
         status_ += "\nDevice API: ";
@@ -98,7 +101,9 @@ public:
         status_ += (blitFilter_ == VK_FILTER_LINEAR ? "linear blit" : "nearest blit");
         status_ += "\nSwapchain images: ";
         status_ += std::to_string(images_.size());
-        status_ += "\nTriangle → half-res image → blit → present: running";
+        status_ += "\nScene: animated ray-marched tunnel";
+        status_ += halfResolution_ ? "\nMode: half resolution → upscale" : "\nMode: native resolution";
+        status_ += "\nGPU timing: Vulkan timestamps when supported";
         return status_;
     }
 
@@ -113,6 +118,25 @@ public:
             device_, 1, &inFlightFence_, VK_TRUE, UINT64_MAX);
         if (result != VK_SUCCESS) {
             return failFrame("ERROR: Waiting for frame fence failed: " + vkResultName(result));
+        }
+
+        // The previous frame is complete, so its timestamp pair is safe to read.
+        if (timestampQueryPool_ != VK_NULL_HANDLE && frameNumber_ > 0) {
+            uint64_t timestamps[2]{};
+            const VkResult queryResult = vkGetQueryPoolResults(
+                device_, timestampQueryPool_, 0, 2,
+                sizeof(timestamps), timestamps, sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT);
+            if (queryResult == VK_SUCCESS) {
+                uint64_t ticks = timestamps[1] - timestamps[0];
+                if (timestampValidBits_ > 0 && timestampValidBits_ < 64) {
+                    const uint64_t mask = (1ULL << timestampValidBits_) - 1ULL;
+                    ticks &= mask;
+                }
+                latestGpuMs_ = static_cast<float>(
+                    static_cast<double>(ticks) *
+                    static_cast<double>(properties_.limits.timestampPeriod) / 1000000.0);
+            }
         }
 
         uint32_t imageIndex = 0;
@@ -159,11 +183,33 @@ public:
         renderPassBegin.clearValueCount = 1;
         renderPassBegin.pClearValues = &clearValue;
 
+        if (timestampQueryPool_ != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(commandBuffer_, timestampQueryPool_, 0, 2);
+            vkCmdWriteTimestamp(
+                commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                timestampQueryPool_, 0);
+        }
+
         vkCmdBeginRenderPass(commandBuffer_, &renderPassBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(
             commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline_);
+
+        const float scenePushData[2] = {
+            static_cast<float>(frameNumber_) * (1.0f / 60.0f),
+            static_cast<float>(offscreenExtent_.width) /
+                static_cast<float>(std::max(1U, offscreenExtent_.height))
+        };
+        vkCmdPushConstants(
+            commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(scenePushData), scenePushData);
         vkCmdDraw(commandBuffer_, 3, 1, 0, 0);
         vkCmdEndRenderPass(commandBuffer_);
+
+        if (timestampQueryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(
+                commandBuffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                timestampQueryPool_, 1);
+        }
 
         // Make the acquired swapchain image a transfer destination.
         VkImageMemoryBarrier swapchainToDst{};
@@ -286,13 +332,28 @@ public:
         return true;
     }
 
-    const std::string& lastStatus() const {
-        return status_;
+    std::string lastStatus() const {
+        std::string report = status_;
+        if (timestampQueryPool_ != VK_NULL_HANDLE) {
+            if (latestGpuMs_ >= 0.0f) {
+                report += "\nGPU scene pass: " + std::to_string(latestGpuMs_) + " ms";
+            } else {
+                report += "\nGPU scene pass: collecting samples...";
+            }
+        } else {
+            report += "\nGPU timestamps: unavailable on this queue";
+        }
+        return report;
     }
 
     void stop() {
         if (device_ != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device_);
+
+            if (timestampQueryPool_ != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(device_, timestampQueryPool_, nullptr);
+                timestampQueryPool_ = VK_NULL_HANDLE;
+            }
 
             for (VkSemaphore semaphore : renderFinished_) {
                 if (semaphore != VK_NULL_HANDLE) {
@@ -446,6 +507,7 @@ private:
                 if (result == VK_SUCCESS && canPresent) {
                     physicalDevice_ = candidate;
                     queueFamilyIndex_ = i;
+                    timestampValidBits_ = families[i].timestampValidBits;
                     vkGetPhysicalDeviceProperties(candidate, &properties_);
                     return true;
                 }
@@ -637,8 +699,9 @@ private:
     }
 
     bool createOffscreenImage() {
-        offscreenExtent_.width = std::max(1U, (extent_.width + 1U) / 2U);
-        offscreenExtent_.height = std::max(1U, (extent_.height + 1U) / 2U);
+        const uint32_t divisor = halfResolution_ ? 2U : 1U;
+        offscreenExtent_.width = std::max(1U, (extent_.width + divisor - 1U) / divisor);
+        offscreenExtent_.height = std::max(1U, (extent_.height + divisor - 1U) / divisor);
 
         VkImageCreateInfo imageInfo{};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -656,7 +719,7 @@ private:
 
         VkResult result = vkCreateImage(device_, &imageInfo, nullptr, &offscreenImage_);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: Creating half-resolution GPU image failed: " + vkResultName(result);
+            status_ = "ERROR: Creating offscreen GPU image failed: " + vkResultName(result);
             return false;
         }
 
@@ -916,8 +979,15 @@ private:
         colorBlending.attachmentCount = 1;
         colorBlending.pAttachments = &colorBlendAttachment;
 
+        VkPushConstantRange scenePushRange{};
+        scenePushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        scenePushRange.offset = 0;
+        scenePushRange.size = sizeof(float) * 2;
+
         VkPipelineLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &scenePushRange;
 
         VkResult result = vkCreatePipelineLayout(
             device_, &layoutInfo, nullptr, &pipelineLayout_);
@@ -957,6 +1027,15 @@ private:
     }
 
     bool createFrameResources() {
+        if (timestampValidBits_ > 0) {
+            VkQueryPoolCreateInfo queryInfo{};
+            queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            queryInfo.queryCount = 2;
+            // Timing is optional: unsupported queues can still render the scene.
+            vkCreateQueryPool(device_, &queryInfo, nullptr, &timestampQueryPool_);
+        }
+
         VkCommandPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1015,6 +1094,7 @@ private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties_{};
     uint32_t queueFamilyIndex_ = 0;
+    uint32_t timestampValidBits_ = 0;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
@@ -1034,6 +1114,9 @@ private:
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline_ = VK_NULL_HANDLE;
     VkFilter blitFilter_ = VK_FILTER_NEAREST;
+    bool halfResolution_ = true;
+    VkQueryPool timestampQueryPool_ = VK_NULL_HANDLE;
+    float latestGpuMs_ = -1.0f;
 
     std::vector<VkSemaphore> renderFinished_;
     VkSemaphore imageAvailable_ = VK_NULL_HANDLE;
@@ -1052,9 +1135,11 @@ Java_com_devdgames_sixsevenframes_MainActivity_nativeStart(
     JNIEnv* env,
     jobject /* thiz */,
     jobject surface,
-    jobject assetManager) {
+    jobject assetManager,
+    jboolean halfResolution) {
     gRenderer = std::make_unique<VulkanRenderer>();
-    const std::string status = gRenderer->start(env, surface, assetManager);
+    const std::string status = gRenderer->start(
+        env, surface, assetManager, halfResolution == JNI_TRUE);
     return env->NewStringUTF(status.c_str());
 }
 
