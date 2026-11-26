@@ -39,6 +39,21 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      - name: Install GLSL compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+
+      - name: Compile Vulkan shaders
+        run: |
+          mkdir -p app/src/main/assets/shaders
+          glslangValidator -V --target-env vulkan1.0 \
+            -o app/src/main/assets/shaders/triangle.vert.spv \
+            app/src/main/shaders/triangle.vert
+          glslangValidator -V --target-env vulkan1.0 \
+            -o app/src/main/assets/shaders/triangle.frag.spv \
+            app/src/main/shaders/triangle.frag
+
       - name: Build debug APK
         run: gradle --no-daemon assembleDebug
 
