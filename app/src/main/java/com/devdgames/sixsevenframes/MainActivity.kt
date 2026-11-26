@@ -228,7 +228,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         return rendererStatus +
             "\nFPS average (10s): %.1f".format(averageFps) +
-            "\n1% low: %.1f FPS".format(onePercentLowFps) +
+            "\n1%% low: %.1f FPS".format(onePercentLowFps) +
             "\nAverage frame: %.2f ms".format(averageFrameMs)
     }
 
