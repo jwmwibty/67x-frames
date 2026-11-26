@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -18,15 +19,15 @@ public:
 
         window_ = ANativeWindow_fromSurface(env, surfaceObject);
         if (window_ == nullptr) {
-            return fail("ERROR: Could not obtain ANativeWindow from Surface.");
+            return abortStart("ERROR: Could not obtain ANativeWindow from Surface.");
         }
 
         VkApplicationInfo appInfo{};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "67xFrames";
-        appInfo.applicationVersion = VK_MAKE_VERSION(0, 2, 0);
+        appInfo.applicationVersion = VK_MAKE_VERSION(0, 3, 0);
         appInfo.pEngineName = "67xFrames";
-        appInfo.engineVersion = VK_MAKE_VERSION(0, 2, 0);
+        appInfo.engineVersion = VK_MAKE_VERSION(0, 3, 0);
         appInfo.apiVersion = VK_API_VERSION_1_0;
 
         const char* instanceExtensions[] = {
@@ -42,7 +43,7 @@ public:
 
         VkResult result = vkCreateInstance(&instanceInfo, nullptr, &instance_);
         if (result != VK_SUCCESS) {
-            return fail("ERROR: vkCreateInstance failed: " + vkResultName(result));
+            return abortStart("ERROR: vkCreateInstance failed: " + vkResultName(result));
         }
 
         VkAndroidSurfaceCreateInfoKHR androidSurfaceInfo{};
@@ -52,26 +53,27 @@ public:
         result = vkCreateAndroidSurfaceKHR(
             instance_, &androidSurfaceInfo, nullptr, &surface_);
         if (result != VK_SUCCESS) {
-            return fail("ERROR: vkCreateAndroidSurfaceKHR failed: " + vkResultName(result));
+            return abortStart(
+                "ERROR: vkCreateAndroidSurfaceKHR failed: " + vkResultName(result));
         }
 
         if (!choosePhysicalDevice()) {
-            return fail("ERROR: No GPU queue supports both graphics and presentation.");
+            return abortStart(status_);
         }
-
         if (!createDevice()) {
-            return fail(status_);
+            return abortStart(status_);
         }
-
         if (!createSwapchain()) {
-            return fail(status_);
+            return abortStart(status_);
         }
-
+        if (!createOffscreenImage()) {
+            return abortStart(status_);
+        }
         if (!createFrameResources()) {
-            return fail(status_);
+            return abortStart(status_);
         }
 
-        status_ = "READY\n67xFrames — Vulkan frame renderer\n";
+        status_ = "READY\n67xFrames — offscreen Vulkan renderer\n";
         status_ += "GPU: ";
         status_ += properties_.deviceName;
         status_ += "\nDevice API: ";
@@ -80,18 +82,25 @@ public:
         status_ += std::to_string(VK_VERSION_MINOR(properties_.apiVersion));
         status_ += ".";
         status_ += std::to_string(VK_VERSION_PATCH(properties_.apiVersion));
-        status_ += "\nSwapchain: ";
+        status_ += "\nOffscreen image: ";
+        status_ += std::to_string(offscreenExtent_.width);
+        status_ += " x ";
+        status_ += std::to_string(offscreenExtent_.height);
+        status_ += "\nUpscaled to: ";
         status_ += std::to_string(extent_.width);
         status_ += " x ";
         status_ += std::to_string(extent_.height);
+        status_ += "\nUpscale filter: ";
+        status_ += (blitFilter_ == VK_FILTER_LINEAR ? "linear blit" : "nearest blit");
         status_ += "\nSwapchain images: ";
         status_ += std::to_string(images_.size());
-        status_ += "\nVulkan clear + present: running";
+        status_ += "\nGPU clear → blit → present: running";
         return status_;
     }
 
     bool drawFrame() {
-        if (device_ == VK_NULL_HANDLE || swapchain_ == VK_NULL_HANDLE) {
+        if (device_ == VK_NULL_HANDLE || swapchain_ == VK_NULL_HANDLE ||
+            offscreenImage_ == VK_NULL_HANDLE) {
             status_ = "ERROR: Renderer is not initialized.";
             return false;
         }
@@ -99,31 +108,24 @@ public:
         VkResult result = vkWaitForFences(
             device_, 1, &inFlightFence_, VK_TRUE, UINT64_MAX);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: Waiting for frame fence failed: " + vkResultName(result);
-            return false;
+            return failFrame("ERROR: Waiting for frame fence failed: " + vkResultName(result));
         }
 
         uint32_t imageIndex = 0;
         result = vkAcquireNextImageKHR(
-            device_, swapchain_, 1000000000ULL,
+            device_, swapchain_, UINT64_MAX,
             imageAvailable_, VK_NULL_HANDLE, &imageIndex);
 
-        if (result == VK_TIMEOUT || result == VK_NOT_READY) {
-            return true;
-        }
         if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-            status_ = "ERROR: Swapchain is out of date. Reopen the app to recreate it.";
-            return false;
+            return failFrame("ERROR: Swapchain is out of date. Reopen the app to recreate it.");
         }
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
-            status_ = "ERROR: vkAcquireNextImageKHR failed: " + vkResultName(result);
-            return false;
+            return failFrame("ERROR: vkAcquireNextImageKHR failed: " + vkResultName(result));
         }
 
         result = vkResetCommandBuffer(commandBuffer_, 0);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: vkResetCommandBuffer failed: " + vkResultName(result);
-            return false;
+            return failFrame("ERROR: vkResetCommandBuffer failed: " + vkResultName(result));
         }
 
         VkCommandBufferBeginInfo beginInfo{};
@@ -131,40 +133,67 @@ public:
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         result = vkBeginCommandBuffer(commandBuffer_, &beginInfo);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: vkBeginCommandBuffer failed: " + vkResultName(result);
-            return false;
+            return failFrame("ERROR: vkBeginCommandBuffer failed: " + vkResultName(result));
         }
 
-        VkImageMemoryBarrier toTransfer{};
-        toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        toTransfer.srcAccessMask = 0;
-        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toTransfer.oldLayout = imageLayouts_[imageIndex];
-        toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toTransfer.image = images_[imageIndex];
-        toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        toTransfer.subresourceRange.baseMipLevel = 0;
-        toTransfer.subresourceRange.levelCount = 1;
-        toTransfer.subresourceRange.baseArrayLayer = 0;
-        toTransfer.subresourceRange.layerCount = 1;
-
-        const VkPipelineStageFlags sourceStage =
-            imageLayouts_[imageIndex] == VK_IMAGE_LAYOUT_UNDEFINED
-                ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        // Reuse the smaller GPU image. It starts undefined, then remains in
+        // TRANSFER_SRC_OPTIMAL after each frame so it can be cleared again.
+        VkImageMemoryBarrier offscreenToDst{};
+        offscreenToDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        offscreenToDst.srcAccessMask =
+            offscreenInitialized_ ? VK_ACCESS_TRANSFER_READ_BIT : 0;
+        offscreenToDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        offscreenToDst.oldLayout = offscreenInitialized_
+            ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+            : VK_IMAGE_LAYOUT_UNDEFINED;
+        offscreenToDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        offscreenToDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        offscreenToDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        offscreenToDst.image = offscreenImage_;
+        offscreenToDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        offscreenToDst.subresourceRange.baseMipLevel = 0;
+        offscreenToDst.subresourceRange.levelCount = 1;
+        offscreenToDst.subresourceRange.baseArrayLayer = 0;
+        offscreenToDst.subresourceRange.layerCount = 1;
 
         vkCmdPipelineBarrier(
             commandBuffer_,
-            sourceStage,
+            offscreenInitialized_ ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                                  : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+            0, 0, nullptr, 0, nullptr, 1, &offscreenToDst);
 
+        // The acquired swapchain image is either first-use UNDEFINED or
+        // PRESENT_SRC_KHR after the presentation engine released it.
+        VkImageMemoryBarrier swapchainToDst{};
+        swapchainToDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        swapchainToDst.srcAccessMask = 0;
+        swapchainToDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        swapchainToDst.oldLayout = imageLayouts_[imageIndex];
+        swapchainToDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        swapchainToDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        swapchainToDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        swapchainToDst.image = images_[imageIndex];
+        swapchainToDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        swapchainToDst.subresourceRange.baseMipLevel = 0;
+        swapchainToDst.subresourceRange.levelCount = 1;
+        swapchainToDst.subresourceRange.baseArrayLayer = 0;
+        swapchainToDst.subresourceRange.layerCount = 1;
+
+        vkCmdPipelineBarrier(
+            commandBuffer_,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &swapchainToDst);
+
+        // Animated clear color makes it visible that new frames are being
+        // produced in the half-resolution image before they are upscaled.
+        const float phase = static_cast<float>(frameNumber_ % 360U) *
+                            0.01745329251994329577f;
         VkClearColorValue clearColor{};
-        clearColor.float32[0] = 0.025f;
-        clearColor.float32[1] = 0.090f;
-        clearColor.float32[2] = 0.145f;
+        clearColor.float32[0] = 0.08f + 0.07f * (0.5f + 0.5f * std::sin(phase));
+        clearColor.float32[1] = 0.10f + 0.08f * (0.5f + 0.5f * std::sin(phase + 2.1f));
+        clearColor.float32[2] = 0.16f + 0.10f * (0.5f + 0.5f * std::sin(phase + 4.2f));
         clearColor.float32[3] = 1.0f;
 
         VkImageSubresourceRange range{};
@@ -176,11 +205,61 @@ public:
 
         vkCmdClearColorImage(
             commandBuffer_,
-            images_[imageIndex],
+            offscreenImage_,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             &clearColor,
             1,
             &range);
+
+        VkImageMemoryBarrier offscreenToSrc{};
+        offscreenToSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        offscreenToSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        offscreenToSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        offscreenToSrc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        offscreenToSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        offscreenToSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        offscreenToSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        offscreenToSrc.image = offscreenImage_;
+        offscreenToSrc.subresourceRange = range;
+
+        vkCmdPipelineBarrier(
+            commandBuffer_,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &offscreenToSrc);
+
+        // Scale the smaller GPU image to the full swapchain extent.
+        VkImageBlit blit{};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = 0;
+        blit.srcSubresource.baseArrayLayer = 0;
+        blit.srcSubresource.layerCount = 1;
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {
+            static_cast<int32_t>(offscreenExtent_.width),
+            static_cast<int32_t>(offscreenExtent_.height),
+            1
+        };
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.mipLevel = 0;
+        blit.dstSubresource.baseArrayLayer = 0;
+        blit.dstSubresource.layerCount = 1;
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {
+            static_cast<int32_t>(extent_.width),
+            static_cast<int32_t>(extent_.height),
+            1
+        };
+
+        vkCmdBlitImage(
+            commandBuffer_,
+            offscreenImage_,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            images_[imageIndex],
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &blit,
+            blitFilter_);
 
         VkImageMemoryBarrier toPresent{};
         toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -201,14 +280,12 @@ public:
 
         result = vkEndCommandBuffer(commandBuffer_);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: vkEndCommandBuffer failed: " + vkResultName(result);
-            return false;
+            return failFrame("ERROR: vkEndCommandBuffer failed: " + vkResultName(result));
         }
 
         result = vkResetFences(device_, 1, &inFlightFence_);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: vkResetFences failed: " + vkResultName(result);
-            return false;
+            return failFrame("ERROR: vkResetFences failed: " + vkResultName(result));
         }
 
         const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -224,10 +301,12 @@ public:
 
         result = vkQueueSubmit(graphicsQueue_, 1, &submitInfo, inFlightFence_);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: vkQueueSubmit failed: " + vkResultName(result);
-            return false;
+            return failFrame("ERROR: vkQueueSubmit failed: " + vkResultName(result));
         }
+
+        offscreenInitialized_ = true;
         imageLayouts_[imageIndex] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        ++frameNumber_;
 
         VkPresentInfoKHR presentInfo{};
         presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -239,14 +318,11 @@ public:
 
         result = vkQueuePresentKHR(presentQueue_, &presentInfo);
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
-            status_ = "ERROR: Swapchain changed size/state. Reopen the app to recreate it.";
-            return false;
+            return failFrame("ERROR: Swapchain changed size/state. Reopen the app to recreate it.");
         }
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: vkQueuePresentKHR failed: " + vkResultName(result);
-            return false;
+            return failFrame("ERROR: vkQueuePresentKHR failed: " + vkResultName(result));
         }
-
         return true;
     }
 
@@ -278,10 +354,19 @@ public:
                 commandPool_ = VK_NULL_HANDLE;
                 commandBuffer_ = VK_NULL_HANDLE;
             }
+            if (offscreenImage_ != VK_NULL_HANDLE) {
+                vkDestroyImage(device_, offscreenImage_, nullptr);
+                offscreenImage_ = VK_NULL_HANDLE;
+            }
+            if (offscreenMemory_ != VK_NULL_HANDLE) {
+                vkFreeMemory(device_, offscreenMemory_, nullptr);
+                offscreenMemory_ = VK_NULL_HANDLE;
+            }
             if (swapchain_ != VK_NULL_HANDLE) {
                 vkDestroySwapchainKHR(device_, swapchain_, nullptr);
                 swapchain_ = VK_NULL_HANDLE;
             }
+
             vkDestroyDevice(device_, nullptr);
             device_ = VK_NULL_HANDLE;
             graphicsQueue_ = VK_NULL_HANDLE;
@@ -304,6 +389,7 @@ public:
         physicalDevice_ = VK_NULL_HANDLE;
         images_.clear();
         imageLayouts_.clear();
+        offscreenInitialized_ = false;
         status_ = "STOPPED";
     }
 
@@ -312,7 +398,7 @@ public:
     }
 
 private:
-    std::string fail(const std::string& message) {
+    std::string abortStart(const std::string& message) {
         status_ = message;
         stopResourcesButKeepStatus();
         return status_;
@@ -322,6 +408,11 @@ private:
         const std::string saved = status_;
         stop();
         status_ = saved;
+    }
+
+    bool failFrame(const std::string& message) {
+        status_ = message;
+        return false;
     }
 
     static std::string vkResultName(VkResult result) {
@@ -344,8 +435,20 @@ private:
         }
 
         for (VkPhysicalDevice candidate : devices) {
-            VkPhysicalDeviceProperties properties{};
-            vkGetPhysicalDeviceProperties(candidate, &properties);
+            uint32_t extensionCount = 0;
+            vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, nullptr);
+            std::vector<VkExtensionProperties> extensions(extensionCount);
+            vkEnumerateDeviceExtensionProperties(
+                candidate, nullptr, &extensionCount, extensions.data());
+
+            bool hasSwapchain = false;
+            for (const auto& extension : extensions) {
+                if (std::string(extension.extensionName) == VK_KHR_SWAPCHAIN_EXTENSION_NAME) {
+                    hasSwapchain = true;
+                    break;
+                }
+            }
+            if (!hasSwapchain) continue;
 
             uint32_t familyCount = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(candidate, &familyCount, nullptr);
@@ -356,19 +459,20 @@ private:
                 if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) {
                     continue;
                 }
+
                 VkBool32 canPresent = VK_FALSE;
                 result = vkGetPhysicalDeviceSurfaceSupportKHR(
                     candidate, i, surface_, &canPresent);
                 if (result == VK_SUCCESS && canPresent) {
                     physicalDevice_ = candidate;
                     queueFamilyIndex_ = i;
-                    properties_ = properties;
+                    vkGetPhysicalDeviceProperties(candidate, &properties_);
                     return true;
                 }
             }
         }
 
-        status_ = "ERROR: No graphics queue can present to this Android surface.";
+        status_ = "ERROR: No GPU queue supports graphics and Android presentation.";
         return false;
     }
 
@@ -431,13 +535,35 @@ private:
             return false;
         }
 
-        VkSurfaceFormatKHR chosenFormat = formats[0];
-        for (const auto& format : formats) {
-            if (format.format == VK_FORMAT_R8G8B8A8_UNORM ||
-                format.format == VK_FORMAT_B8G8R8A8_UNORM) {
-                chosenFormat = format;
+        bool foundFormat = false;
+        for (const auto& candidate : formats) {
+            VkFormat candidateFormat = candidate.format;
+            if (candidateFormat == VK_FORMAT_UNDEFINED) {
+                candidateFormat = VK_FORMAT_R8G8B8A8_UNORM;
+            }
+
+            VkFormatProperties formatProperties{};
+            vkGetPhysicalDeviceFormatProperties(
+                physicalDevice_, candidateFormat, &formatProperties);
+            const VkFormatFeatureFlags required =
+                VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+
+            if ((formatProperties.optimalTilingFeatures & required) == required) {
+                surfaceFormat_ = candidate;
+                surfaceFormat_.format = candidateFormat;
+                blitFilter_ =
+                    (formatProperties.optimalTilingFeatures &
+                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+                        ? VK_FILTER_LINEAR
+                        : VK_FILTER_NEAREST;
+                foundFormat = true;
                 break;
             }
+        }
+
+        if (!foundFormat) {
+            status_ = "ERROR: No surface format supports Vulkan blit source and destination.";
+            return false;
         }
 
         VkExtent2D chosenExtent = capabilities.currentExtent;
@@ -476,8 +602,8 @@ private:
         swapchainInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         swapchainInfo.surface = surface_;
         swapchainInfo.minImageCount = imageCount;
-        swapchainInfo.imageFormat = chosenFormat.format;
-        swapchainInfo.imageColorSpace = chosenFormat.colorSpace;
+        swapchainInfo.imageFormat = surfaceFormat_.format;
+        swapchainInfo.imageColorSpace = surfaceFormat_.colorSpace;
         swapchainInfo.imageExtent = extent_;
         swapchainInfo.imageArrayLayers = 1;
         swapchainInfo.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -515,6 +641,74 @@ private:
         return true;
     }
 
+    uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags desired) {
+        VkPhysicalDeviceMemoryProperties memoryProperties{};
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memoryProperties);
+
+        for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+            if ((typeBits & (1U << i)) != 0 &&
+                (memoryProperties.memoryTypes[i].propertyFlags & desired) == desired) {
+                return i;
+            }
+        }
+        return UINT32_MAX;
+    }
+
+    bool createOffscreenImage() {
+        offscreenExtent_.width = std::max(1U, (extent_.width + 1U) / 2U);
+        offscreenExtent_.height = std::max(1U, (extent_.height + 1U) / 2U);
+
+        VkImageCreateInfo imageInfo{};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = surfaceFormat_.format;
+        imageInfo.extent = {offscreenExtent_.width, offscreenExtent_.height, 1};
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        VkResult result = vkCreateImage(device_, &imageInfo, nullptr, &offscreenImage_);
+        if (result != VK_SUCCESS) {
+            status_ = "ERROR: Creating half-resolution GPU image failed: " + vkResultName(result);
+            return false;
+        }
+
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(device_, offscreenImage_, &requirements);
+
+        uint32_t memoryType = findMemoryType(
+            requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryType == UINT32_MAX) {
+            memoryType = findMemoryType(requirements.memoryTypeBits, 0);
+        }
+        if (memoryType == UINT32_MAX) {
+            status_ = "ERROR: No compatible Vulkan memory type for offscreen image.";
+            return false;
+        }
+
+        VkMemoryAllocateInfo allocationInfo{};
+        allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocationInfo.allocationSize = requirements.size;
+        allocationInfo.memoryTypeIndex = memoryType;
+
+        result = vkAllocateMemory(device_, &allocationInfo, nullptr, &offscreenMemory_);
+        if (result != VK_SUCCESS) {
+            status_ = "ERROR: Allocating offscreen image memory failed: " + vkResultName(result);
+            return false;
+        }
+
+        result = vkBindImageMemory(device_, offscreenImage_, offscreenMemory_, 0);
+        if (result != VK_SUCCESS) {
+            status_ = "ERROR: Binding offscreen image memory failed: " + vkResultName(result);
+            return false;
+        }
+        return true;
+    }
+
     bool createFrameResources() {
         VkCommandPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -543,14 +737,14 @@ private:
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         result = vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailable_);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: Could not create image-available semaphore.";
+            status_ = "ERROR: Could not create image-available semaphore: " + vkResultName(result);
             return false;
         }
 
         for (auto& semaphore : renderFinished_) {
             result = vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &semaphore);
             if (result != VK_SUCCESS) {
-                status_ = "ERROR: Could not create render-finished semaphores.";
+                status_ = "ERROR: Could not create render-finished semaphore: " + vkResultName(result);
                 return false;
             }
         }
@@ -560,7 +754,7 @@ private:
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         result = vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFence_);
         if (result != VK_SUCCESS) {
-            status_ = "ERROR: Could not create frame fence.";
+            status_ = "ERROR: Could not create frame fence: " + vkResultName(result);
             return false;
         }
         return true;
@@ -575,15 +769,26 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
+
+    VkSurfaceFormatKHR surfaceFormat_{};
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkExtent2D extent_{};
     std::vector<VkImage> images_;
     std::vector<VkImageLayout> imageLayouts_;
+
+    VkImage offscreenImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory offscreenMemory_ = VK_NULL_HANDLE;
+    VkExtent2D offscreenExtent_{};
+    bool offscreenInitialized_ = false;
+    VkFilter blitFilter_ = VK_FILTER_NEAREST;
+
     std::vector<VkSemaphore> renderFinished_;
     VkSemaphore imageAvailable_ = VK_NULL_HANDLE;
     VkFence inFlightFence_ = VK_NULL_HANDLE;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
+
+    uint64_t frameNumber_ = 0;
     std::string status_ = "STOPPED";
 };
 
