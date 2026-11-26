@@ -42,7 +42,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var currentSurface: Surface? = null
     private var halfResolution = true
     // 0 = fully off, 1 = partial lighting, 2 = maximum lighting quality.
-    private var lightingMode = 2
+    private var lightingMode = 0 // Safe startup: OFF. User can cycle to PARTIAL and MAX.
 
     private val frameSamples = ArrayDeque<FrameSample>()
     private var previousFrameNs = 0L

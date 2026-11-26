@@ -65,7 +65,7 @@ float softShadow(vec3 ro, vec3 rd) {
     float result = 1.0;
     float t = 0.045;
     int unusedMaterial;
-    for (int i = 0; i < 12; ++i) {
+    for (int i = 0; i < 6; ++i) {
         float h = sceneMap(ro + rd * t, unusedMaterial);
         result = min(result, 9.0 * h / t);
         t += clamp(h, 0.035, 0.45);
@@ -78,7 +78,7 @@ float ambientOcclusion(vec3 p, vec3 n) {
     float result = 0.0;
     float weight = 1.0;
     int unusedMaterial;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 3; ++i) {
         float h = 0.035 + 0.13 * float(i);
         float d = sceneMap(p + n * h, unusedMaterial);
         result += (h - d) * weight;
@@ -111,8 +111,8 @@ void main() {
     float travel = 0.025;
     int materialId = 0;
     bool hit = false;
-    int maxSteps = scene.lightingMode < 0.5 ? 36 :
-                   (scene.lightingMode < 1.5 ? 48 : 64);
+    int maxSteps = scene.lightingMode < 0.5 ? 24 :
+                   (scene.lightingMode < 1.5 ? 32 : 48);
 
     // Higher lighting presets also enable a deeper ray-march workload.
     for (int stepIndex = 0; stepIndex < 64; ++stepIndex) {
