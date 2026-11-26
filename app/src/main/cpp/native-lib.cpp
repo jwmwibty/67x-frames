@@ -21,9 +21,11 @@ public:
             JNIEnv* env,
             jobject surfaceObject,
             jobject assetManagerObject,
-            bool halfResolution) {
+            bool halfResolution,
+            uint32_t lightingMode) {
         stop();
         halfResolution_ = halfResolution;
+        lightingMode_ = std::min(lightingMode, 2U);
 
         window_ = ANativeWindow_fromSurface(env, surfaceObject);
         if (window_ == nullptr) {
@@ -103,6 +105,8 @@ public:
         status_ += std::to_string(images_.size());
         status_ += "\nScene: animated ray-marched tunnel";
         status_ += halfResolution_ ? "\nMode: half resolution → upscale" : "\nMode: native resolution";
+        status_ += "\nLighting: ";
+        status_ += lightingMode_ == 0U ? "OFF" : (lightingMode_ == 1U ? "PARTIAL" : "MAX");
         status_ += "\nGPU timing: Vulkan timestamps when supported";
         return status_;
     }
@@ -194,10 +198,11 @@ public:
         vkCmdBindPipeline(
             commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline_);
 
-        const float scenePushData[2] = {
+        const float scenePushData[3] = {
             static_cast<float>(frameNumber_) * (1.0f / 60.0f),
             static_cast<float>(offscreenExtent_.width) /
-                static_cast<float>(std::max(1U, offscreenExtent_.height))
+                static_cast<float>(std::max(1U, offscreenExtent_.height)),
+            static_cast<float>(lightingMode_)
         };
         vkCmdPushConstants(
             commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -982,7 +987,7 @@ private:
         VkPushConstantRange scenePushRange{};
         scenePushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         scenePushRange.offset = 0;
-        scenePushRange.size = sizeof(float) * 2;
+        scenePushRange.size = sizeof(float) * 3;
 
         VkPipelineLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1115,6 +1120,7 @@ private:
     VkPipeline graphicsPipeline_ = VK_NULL_HANDLE;
     VkFilter blitFilter_ = VK_FILTER_NEAREST;
     bool halfResolution_ = true;
+    uint32_t lightingMode_ = 2;
     VkQueryPool timestampQueryPool_ = VK_NULL_HANDLE;
     float latestGpuMs_ = -1.0f;
 
@@ -1136,10 +1142,12 @@ Java_com_devdgames_sixsevenframes_MainActivity_nativeStart(
     jobject /* thiz */,
     jobject surface,
     jobject assetManager,
-    jboolean halfResolution) {
+    jboolean halfResolution,
+    jint lightingMode) {
     gRenderer = std::make_unique<VulkanRenderer>();
     const std::string status = gRenderer->start(
-        env, surface, assetManager, halfResolution == JNI_TRUE);
+        env, surface, assetManager, halfResolution == JNI_TRUE,
+        static_cast<uint32_t>(std::max(0, lightingMode)));
     return env->NewStringUTF(status.c_str());
 }
 

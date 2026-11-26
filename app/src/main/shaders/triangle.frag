@@ -6,6 +6,7 @@ layout(location = 0) out vec4 outColor;
 layout(push_constant) uniform ScenePush {
     float timeSeconds;
     float aspectRatio;
+    float lightingMode;
 } scene;
 
 float sdBox(vec3 p, vec3 b) {
@@ -33,7 +34,8 @@ float sceneMap(vec3 p, out int materialId) {
     if (pillars < d) { d = pillars; materialId = 3; }
 
     vec2 archPoint = vec2(p.x / 3.12, (p.y - 0.12) / 2.16);
-    float archCurve = (length(archPoint) - 1.0) * 0.16 - 0.035;
+    // The absolute value makes a thin arch ring, leaving the centre passage open.
+    float archCurve = abs(length(archPoint) - 1.0) * 0.16 - 0.035;
     float arch = max(archCurve, abs(q.z) - 0.075);
     if (arch < d) { d = arch; materialId = 4; }
 
@@ -89,13 +91,13 @@ vec3 materialColor(int materialId, vec3 p) {
     if (materialId == 1) {
         vec2 cell = abs(fract(vec2(p.x * 1.2, p.z * 0.5)) - 0.5);
         float seam = 1.0 - smoothstep(0.018, 0.055, min(cell.x, cell.y));
-        return mix(vec3(0.15, 0.19, 0.24), vec3(0.065, 0.085, 0.11), seam * 0.72);
+        return mix(vec3(0.23, 0.28, 0.34), vec3(0.075, 0.10, 0.14), seam * 0.72);
     }
-    if (materialId == 2) return vec3(0.105, 0.14, 0.19);
-    if (materialId == 3) return vec3(0.28, 0.32, 0.38);
-    if (materialId == 4) return vec3(0.16, 0.22, 0.29);
-    if (materialId == 5) return vec3(0.08, 0.72, 1.0);
-    return vec3(0.95, 0.43, 0.12);
+    if (materialId == 2) return vec3(0.19, 0.24, 0.31);
+    if (materialId == 3) return vec3(0.40, 0.46, 0.52);
+    if (materialId == 4) return vec3(0.26, 0.34, 0.43);
+    if (materialId == 5) return vec3(0.08, 0.78, 1.0);
+    return vec3(1.0, 0.48, 0.14);
 }
 
 void main() {
@@ -109,9 +111,12 @@ void main() {
     float travel = 0.025;
     int materialId = 0;
     bool hit = false;
+    int maxSteps = scene.lightingMode < 0.5 ? 36 :
+                   (scene.lightingMode < 1.5 ? 48 : 64);
 
-    // Deliberately substantial per-pixel workload for the mobile GPU benchmark.
+    // Higher lighting presets also enable a deeper ray-march workload.
     for (int stepIndex = 0; stepIndex < 64; ++stepIndex) {
+        if (stepIndex >= maxSteps) break;
         vec3 p = ro + rd * travel;
         float distanceToScene = sceneMap(p, materialId);
         if (distanceToScene < 0.0035) { hit = true; break; }
@@ -119,30 +124,57 @@ void main() {
         if (travel > 42.0) break;
     }
 
-    vec3 color = vec3(0.012, 0.020, 0.038);
+    vec3 color = vec3(0.018, 0.030, 0.050);
     if (hit) {
         vec3 p = ro + rd * travel;
         vec3 n = sceneNormal(p);
-        vec3 lightPosition = vec3(0.0, 1.85, ro.z + 3.2);
-        vec3 toLight = lightPosition - p;
-        float lightDistance = length(toLight);
-        vec3 lightDirection = toLight / max(lightDistance, 0.001);
-        float diffuse = max(dot(n, lightDirection), 0.0);
-        float shadow = softShadow(p + n * 0.012, lightDirection);
-        float ao = ambientOcclusion(p, n);
-        vec3 viewDirection = normalize(ro - p);
-        vec3 halfDirection = normalize(lightDirection + viewDirection);
-        float specular = pow(max(dot(n, halfDirection), 0.0), 40.0);
-
         vec3 base = materialColor(materialId, p);
-        float attenuation = 1.0 / (1.0 + 0.055 * lightDistance * lightDistance);
-        color = base * (0.12 + diffuse * shadow * attenuation * 1.55) * ao;
-        color += vec3(0.55, 0.72, 1.0) * specular * shadow * 0.34;
-        if (materialId == 5) color += vec3(0.015, 0.52, 0.95) * 1.25;
-        if (materialId == 6) color += vec3(1.0, 0.30, 0.075) * 1.8;
 
-        float fog = exp(-travel * 0.035);
-        color = mix(vec3(0.012, 0.022, 0.045), color, fog);
+        if (scene.lightingMode < 0.5) {
+            // Lighting completely disabled: retain readable, unlit geometry.
+            color = base * 0.92;
+        } else {
+            vec3 viewDirection = normalize(ro - p);
+            vec3 keyDirection = normalize(vec3(-0.42, 0.82, -0.38));
+            float diffuse = max(dot(n, keyDirection), 0.0);
+            float fill = max(dot(n, normalize(vec3(0.65, 0.30, -0.55))), 0.0);
+
+            float lightA = floor(p.z / 3.0) * 3.0 + 1.5;
+            vec3 pointA = vec3(-2.15, 1.72, lightA);
+            vec3 pointB = vec3( 2.15, 1.72, lightA);
+            vec3 toA = pointA - p;
+            vec3 toB = pointB - p;
+            float distanceA = length(toA);
+            float distanceB = length(toB);
+            float pointLightA = max(dot(n, toA / max(distanceA, 0.001)), 0.0) /
+                                (1.0 + 0.10 * distanceA * distanceA);
+            float pointLightB = max(dot(n, toB / max(distanceB, 0.001)), 0.0) /
+                                (1.0 + 0.10 * distanceB * distanceB);
+
+            float shadow = 1.0;
+            float ao = 1.0;
+            float specular = 0.0;
+            if (scene.lightingMode > 1.5) {
+                shadow = softShadow(p + n * 0.012, keyDirection);
+                ao = ambientOcclusion(p, n);
+                vec3 halfDirection = normalize(keyDirection + viewDirection);
+                specular = pow(max(dot(n, halfDirection), 0.0), 40.0);
+            }
+
+            float ambient = scene.lightingMode < 1.5 ? 0.42 : 0.30;
+            float direct = diffuse * (scene.lightingMode > 1.5 ? shadow : 1.0);
+            color = base * (ambient + direct * 0.95 + fill * 0.18 +
+                            (pointLightA + pointLightB) * 0.75) * ao;
+            if (scene.lightingMode > 1.5) {
+                color += vec3(0.65, 0.82, 1.0) * specular * shadow * 0.42;
+            }
+        }
+
+        if (materialId == 5) color += vec3(0.02, 0.62, 1.0) * 1.15;
+        if (materialId == 6) color += vec3(1.0, 0.34, 0.08) * 1.75;
+
+        float fog = exp(-travel * 0.028);
+        color = mix(vec3(0.018, 0.035, 0.060), color, fog);
     }
 
     color = color / (color + vec3(1.0));
