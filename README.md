@@ -1,17 +1,17 @@
 # 67xFrames
 
-An Android-native graphics research project exploring lower-cost rendering and spatial reconstruction.
+An Android-native Vulkan graphics research project exploring lower-cost rendering and spatial reconstruction.
 
-## Current milestone
+## Current benchmark scene
 
-- Kotlin Android activity
-- Native C++ library built with the Android NDK and CMake
-- Vulkan loader linked into the native library
-- Runtime Vulkan instance/device probe (GPU name and Vulkan API version)
-- GitHub Actions debug APK build
+- A full-screen procedural 3D tunnel generated in a fragment shader; no external model or texture files are required.
+- Ray-marched signed-distance geometry with repeating arches, pillars, emissive strips, soft shadows, ambient occlusion, specular lighting, fog, and camera motion.
+- A one-tap switch between native-resolution and half-resolution rendering. Half resolution is upscaled to the Android surface using Vulkan image blitting.
+- Vulkan timestamp-query reporting for the offscreen scene pass when the selected GPU queue supports timestamps.
+- Kotlin Android activity, native C++ renderer, and GitHub Actions debug APK build.
 
-This is **not yet** a system-wide game interceptor or a Vulkan layer. The first goal is to verify the app build and Vulkan access from a native Android process. Rendering, swapchain/surface handling, interception, and upscaling will be added in later milestones.
+The scene is a deliberately shader-heavy workload, not a production game or a system-wide game interceptor. GPU timings measure the offscreen scene pass; they do not include the final blit, Android composition, or display scanout.
 
 ## Build
 
-Push to `main` or run **Actions → Android CI → Run workflow**. The workflow builds a debug APK and uploads it as the `67xFrames-debug-apk` artifact.
+Push to main or run Actions → Android CI → Run workflow. The workflow compiles the GLSL shaders, builds a debug APK, and uploads it as the 67xFrames-debug-apk artifact.
