@@ -104,8 +104,8 @@ void main() {
         vec3 base = getBaseColor(materialId, hitPosition);
 
         // Repeating blue wall strips and warm ceiling lamps are emissive accents.
-        float strip = smoothstep(0.035, 0.0, abs(abs(hitPosition.x) - 3.28));
-        float lampBand = smoothstep(0.035, 0.0, abs(fract(hitPosition.z / 3.0) - 0.5));
+        float strip = 1.0 - smoothstep(0.0, 0.035, abs(abs(hitPosition.x) - 3.28));
+        float lampBand = 1.0 - smoothstep(0.0, 0.035, abs(fract(hitPosition.z / 3.0) - 0.5));
         vec3 emission = vec3(0.02, 0.22, 0.38) * strip;
         if (materialId == 2) emission += vec3(0.30, 0.095, 0.025) * lampBand;
 
