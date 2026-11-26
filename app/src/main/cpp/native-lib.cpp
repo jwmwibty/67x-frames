@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -26,6 +25,7 @@ public:
         stop();
         halfResolution_ = halfResolution;
         lightingMode_ = std::min(lightingMode, 2U);
+        frameNumber_ = 0;
 
         window_ = ANativeWindow_fromSurface(env, surfaceObject);
         if (window_ == nullptr) {
@@ -107,7 +107,7 @@ public:
         status_ += halfResolution_ ? "\nMode: half resolution → upscale" : "\nMode: native resolution";
         status_ += "\nLighting: ";
         status_ += lightingMode_ == 0U ? "OFF" : (lightingMode_ == 1U ? "PARTIAL" : "MAX");
-        status_ += "\nGPU timing: Vulkan timestamps when supported";
+        status_ += "\nGPU timing: FPS-only compatibility mode";
         return status_;
     }
 
@@ -122,25 +122,6 @@ public:
             device_, 1, &inFlightFence_, VK_TRUE, UINT64_MAX);
         if (result != VK_SUCCESS) {
             return failFrame("ERROR: Waiting for frame fence failed: " + vkResultName(result));
-        }
-
-        // The previous frame is complete, so its timestamp pair is safe to read.
-        if (timestampQueryPool_ != VK_NULL_HANDLE && frameNumber_ > 0) {
-            uint64_t timestamps[2]{};
-            const VkResult queryResult = vkGetQueryPoolResults(
-                device_, timestampQueryPool_, 0, 2,
-                sizeof(timestamps), timestamps, sizeof(uint64_t),
-                VK_QUERY_RESULT_64_BIT);
-            if (queryResult == VK_SUCCESS) {
-                uint64_t ticks = timestamps[1] - timestamps[0];
-                if (timestampValidBits_ > 0 && timestampValidBits_ < 64) {
-                    const uint64_t mask = (1ULL << timestampValidBits_) - 1ULL;
-                    ticks &= mask;
-                }
-                latestGpuMs_ = static_cast<float>(
-                    static_cast<double>(ticks) *
-                    static_cast<double>(properties_.limits.timestampPeriod) / 1000000.0);
-            }
         }
 
         uint32_t imageIndex = 0;
@@ -187,13 +168,6 @@ public:
         renderPassBegin.clearValueCount = 1;
         renderPassBegin.pClearValues = &clearValue;
 
-        if (timestampQueryPool_ != VK_NULL_HANDLE) {
-            vkCmdResetQueryPool(commandBuffer_, timestampQueryPool_, 0, 2);
-            vkCmdWriteTimestamp(
-                commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                timestampQueryPool_, 0);
-        }
-
         vkCmdBeginRenderPass(commandBuffer_, &renderPassBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(
             commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline_);
@@ -209,12 +183,6 @@ public:
             0, sizeof(scenePushData), scenePushData);
         vkCmdDraw(commandBuffer_, 3, 1, 0, 0);
         vkCmdEndRenderPass(commandBuffer_);
-
-        if (timestampQueryPool_ != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp(
-                commandBuffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                timestampQueryPool_, 1);
-        }
 
         // Make the acquired swapchain image a transfer destination.
         VkImageMemoryBarrier swapchainToDst{};
@@ -338,27 +306,12 @@ public:
     }
 
     std::string lastStatus() const {
-        std::string report = status_;
-        if (timestampQueryPool_ != VK_NULL_HANDLE) {
-            if (latestGpuMs_ >= 0.0f) {
-                report += "\nGPU scene pass: " + std::to_string(latestGpuMs_) + " ms";
-            } else {
-                report += "\nGPU scene pass: collecting samples...";
-            }
-        } else {
-            report += "\nGPU timestamps: unavailable on this queue";
-        }
-        return report;
+        return status_;
     }
 
     void stop() {
         if (device_ != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device_);
-
-            if (timestampQueryPool_ != VK_NULL_HANDLE) {
-                vkDestroyQueryPool(device_, timestampQueryPool_, nullptr);
-                timestampQueryPool_ = VK_NULL_HANDLE;
-            }
 
             for (VkSemaphore semaphore : renderFinished_) {
                 if (semaphore != VK_NULL_HANDLE) {
@@ -512,7 +465,6 @@ private:
                 if (result == VK_SUCCESS && canPresent) {
                     physicalDevice_ = candidate;
                     queueFamilyIndex_ = i;
-                    timestampValidBits_ = families[i].timestampValidBits;
                     vkGetPhysicalDeviceProperties(candidate, &properties_);
                     return true;
                 }
@@ -1032,15 +984,6 @@ private:
     }
 
     bool createFrameResources() {
-        if (timestampValidBits_ > 0) {
-            VkQueryPoolCreateInfo queryInfo{};
-            queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-            queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            queryInfo.queryCount = 2;
-            // Timing is optional: unsupported queues can still render the scene.
-            vkCreateQueryPool(device_, &queryInfo, nullptr, &timestampQueryPool_);
-        }
-
         VkCommandPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1099,7 +1042,6 @@ private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties_{};
     uint32_t queueFamilyIndex_ = 0;
-    uint32_t timestampValidBits_ = 0;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
@@ -1121,8 +1063,6 @@ private:
     VkFilter blitFilter_ = VK_FILTER_NEAREST;
     bool halfResolution_ = true;
     uint32_t lightingMode_ = 2;
-    VkQueryPool timestampQueryPool_ = VK_NULL_HANDLE;
-    float latestGpuMs_ = -1.0f;
 
     std::vector<VkSemaphore> renderFinished_;
     VkSemaphore imageAvailable_ = VK_NULL_HANDLE;
