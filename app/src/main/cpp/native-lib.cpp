@@ -941,6 +941,7 @@ private:
         pipelineInfo.layout = pipelineLayout_;
         pipelineInfo.renderPass = renderPass_;
         pipelineInfo.subpass = 0;
+        pipelineInfo.basePipelineIndex = -1;
 
         result = vkCreateGraphicsPipelines(
             device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline_);
