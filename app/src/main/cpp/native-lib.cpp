@@ -1,6 +1,8 @@
 #define VK_USE_PLATFORM_ANDROID_KHR
 
 #include <jni.h>
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <vulkan/vulkan.h>
@@ -14,7 +16,10 @@
 
 class VulkanRenderer {
 public:
-    std::string start(JNIEnv* env, jobject surfaceObject) {
+    std::string start(
+            JNIEnv* env,
+            jobject surfaceObject,
+            jobject assetManagerObject) {
         stop();
 
         window_ = ANativeWindow_fromSurface(env, surfaceObject);
@@ -22,12 +27,17 @@ public:
             return abortStart("ERROR: Could not obtain ANativeWindow from Surface.");
         }
 
+        AAssetManager* assetManager = AAssetManager_fromJava(env, assetManagerObject);
+        if (assetManager == nullptr) {
+            return abortStart("ERROR: Could not access Android shader assets.");
+        }
+
         VkApplicationInfo appInfo{};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "67xFrames";
-        appInfo.applicationVersion = VK_MAKE_VERSION(0, 3, 0);
+        appInfo.applicationVersion = VK_MAKE_VERSION(0, 4, 0);
         appInfo.pEngineName = "67xFrames";
-        appInfo.engineVersion = VK_MAKE_VERSION(0, 3, 0);
+        appInfo.engineVersion = VK_MAKE_VERSION(0, 4, 0);
         appInfo.apiVersion = VK_API_VERSION_1_0;
 
         const char* instanceExtensions[] = {
@@ -57,23 +67,15 @@ public:
                 "ERROR: vkCreateAndroidSurfaceKHR failed: " + vkResultName(result));
         }
 
-        if (!choosePhysicalDevice()) {
-            return abortStart(status_);
-        }
-        if (!createDevice()) {
-            return abortStart(status_);
-        }
-        if (!createSwapchain()) {
-            return abortStart(status_);
-        }
-        if (!createOffscreenImage()) {
-            return abortStart(status_);
-        }
-        if (!createFrameResources()) {
-            return abortStart(status_);
-        }
+        if (!choosePhysicalDevice()) return abortStart(status_);
+        if (!createDevice()) return abortStart(status_);
+        if (!createSwapchain()) return abortStart(status_);
+        if (!createOffscreenImage()) return abortStart(status_);
+        if (!createRenderPassAndFramebuffer()) return abortStart(status_);
+        if (!createGraphicsPipeline(assetManager)) return abortStart(status_);
+        if (!createFrameResources()) return abortStart(status_);
 
-        status_ = "READY\n67xFrames — offscreen Vulkan renderer\n";
+        status_ = "READY\n67xFrames — Vulkan triangle renderer\n";
         status_ += "GPU: ";
         status_ += properties_.deviceName;
         status_ += "\nDevice API: ";
@@ -90,17 +92,19 @@ public:
         status_ += std::to_string(extent_.width);
         status_ += " x ";
         status_ += std::to_string(extent_.height);
+        status_ += "\nGraphics pipeline: ready";
+        status_ += "\nDraw: 3 vertices (no vertex buffer)";
         status_ += "\nUpscale filter: ";
         status_ += (blitFilter_ == VK_FILTER_LINEAR ? "linear blit" : "nearest blit");
         status_ += "\nSwapchain images: ";
         status_ += std::to_string(images_.size());
-        status_ += "\nGPU clear → blit → present: running";
+        status_ += "\nTriangle → half-res image → blit → present: running";
         return status_;
     }
 
     bool drawFrame() {
         if (device_ == VK_NULL_HANDLE || swapchain_ == VK_NULL_HANDLE ||
-            offscreenImage_ == VK_NULL_HANDLE) {
+            offscreenImage_ == VK_NULL_HANDLE || graphicsPipeline_ == VK_NULL_HANDLE) {
             status_ = "ERROR: Renderer is not initialized.";
             return false;
         }
@@ -136,35 +140,32 @@ public:
             return failFrame("ERROR: vkBeginCommandBuffer failed: " + vkResultName(result));
         }
 
-        // Reuse the smaller GPU image. It starts undefined, then remains in
-        // TRANSFER_SRC_OPTIMAL after each frame so it can be cleared again.
-        VkImageMemoryBarrier offscreenToDst{};
-        offscreenToDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        offscreenToDst.srcAccessMask =
-            offscreenInitialized_ ? VK_ACCESS_TRANSFER_READ_BIT : 0;
-        offscreenToDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        offscreenToDst.oldLayout = offscreenInitialized_
-            ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-            : VK_IMAGE_LAYOUT_UNDEFINED;
-        offscreenToDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        offscreenToDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        offscreenToDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        offscreenToDst.image = offscreenImage_;
-        offscreenToDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        offscreenToDst.subresourceRange.baseMipLevel = 0;
-        offscreenToDst.subresourceRange.levelCount = 1;
-        offscreenToDst.subresourceRange.baseArrayLayer = 0;
-        offscreenToDst.subresourceRange.layerCount = 1;
+        // Render a real three-vertex triangle into the half-resolution image.
+        // The render pass transitions its final layout to TRANSFER_SRC_OPTIMAL.
+        VkClearValue clearValue{};
+        const float phase = static_cast<float>(frameNumber_ % 360U) *
+                            0.01745329251994329577f;
+        clearValue.color.float32[0] = 0.025f + 0.025f * (0.5f + 0.5f * std::sin(phase));
+        clearValue.color.float32[1] = 0.035f + 0.030f * (0.5f + 0.5f * std::sin(phase + 2.1f));
+        clearValue.color.float32[2] = 0.070f + 0.040f * (0.5f + 0.5f * std::sin(phase + 4.2f));
+        clearValue.color.float32[3] = 1.0f;
 
-        vkCmdPipelineBarrier(
-            commandBuffer_,
-            offscreenInitialized_ ? VK_PIPELINE_STAGE_TRANSFER_BIT
-                                  : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &offscreenToDst);
+        VkRenderPassBeginInfo renderPassBegin{};
+        renderPassBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassBegin.renderPass = renderPass_;
+        renderPassBegin.framebuffer = framebuffer_;
+        renderPassBegin.renderArea.offset = {0, 0};
+        renderPassBegin.renderArea.extent = offscreenExtent_;
+        renderPassBegin.clearValueCount = 1;
+        renderPassBegin.pClearValues = &clearValue;
 
-        // The acquired swapchain image is either first-use UNDEFINED or
-        // PRESENT_SRC_KHR after the presentation engine released it.
+        vkCmdBeginRenderPass(commandBuffer_, &renderPassBegin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(
+            commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline_);
+        vkCmdDraw(commandBuffer_, 3, 1, 0, 0);
+        vkCmdEndRenderPass(commandBuffer_);
+
+        // Make the acquired swapchain image a transfer destination.
         VkImageMemoryBarrier swapchainToDst{};
         swapchainToDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         swapchainToDst.srcAccessMask = 0;
@@ -186,49 +187,7 @@ public:
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &swapchainToDst);
 
-        // Animated clear color makes it visible that new frames are being
-        // produced in the half-resolution image before they are upscaled.
-        const float phase = static_cast<float>(frameNumber_ % 360U) *
-                            0.01745329251994329577f;
-        VkClearColorValue clearColor{};
-        clearColor.float32[0] = 0.08f + 0.07f * (0.5f + 0.5f * std::sin(phase));
-        clearColor.float32[1] = 0.10f + 0.08f * (0.5f + 0.5f * std::sin(phase + 2.1f));
-        clearColor.float32[2] = 0.16f + 0.10f * (0.5f + 0.5f * std::sin(phase + 4.2f));
-        clearColor.float32[3] = 1.0f;
-
-        VkImageSubresourceRange range{};
-        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        range.baseMipLevel = 0;
-        range.levelCount = 1;
-        range.baseArrayLayer = 0;
-        range.layerCount = 1;
-
-        vkCmdClearColorImage(
-            commandBuffer_,
-            offscreenImage_,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            &clearColor,
-            1,
-            &range);
-
-        VkImageMemoryBarrier offscreenToSrc{};
-        offscreenToSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        offscreenToSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        offscreenToSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        offscreenToSrc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        offscreenToSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        offscreenToSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        offscreenToSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        offscreenToSrc.image = offscreenImage_;
-        offscreenToSrc.subresourceRange = range;
-
-        vkCmdPipelineBarrier(
-            commandBuffer_,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &offscreenToSrc);
-
-        // Scale the smaller GPU image to the full swapchain extent.
+        // Scale the real triangle image to the full swapchain dimensions.
         VkImageBlit blit{};
         blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         blit.srcSubresource.mipLevel = 0;
@@ -270,7 +229,7 @@ public:
         toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toPresent.image = images_[imageIndex];
-        toPresent.subresourceRange = range;
+        toPresent.subresourceRange = swapchainToDst.subresourceRange;
 
         vkCmdPipelineBarrier(
             commandBuffer_,
@@ -288,6 +247,8 @@ public:
             return failFrame("ERROR: vkResetFences failed: " + vkResultName(result));
         }
 
+        // Wait for the acquired swapchain image only at the transfer stage.
+        // The offscreen triangle pass can execute before that wait is needed.
         const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -304,7 +265,6 @@ public:
             return failFrame("ERROR: vkQueueSubmit failed: " + vkResultName(result));
         }
 
-        offscreenInitialized_ = true;
         imageLayouts_[imageIndex] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         ++frameNumber_;
 
@@ -354,6 +314,27 @@ public:
                 commandPool_ = VK_NULL_HANDLE;
                 commandBuffer_ = VK_NULL_HANDLE;
             }
+
+            if (graphicsPipeline_ != VK_NULL_HANDLE) {
+                vkDestroyPipeline(device_, graphicsPipeline_, nullptr);
+                graphicsPipeline_ = VK_NULL_HANDLE;
+            }
+            if (pipelineLayout_ != VK_NULL_HANDLE) {
+                vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+                pipelineLayout_ = VK_NULL_HANDLE;
+            }
+            if (framebuffer_ != VK_NULL_HANDLE) {
+                vkDestroyFramebuffer(device_, framebuffer_, nullptr);
+                framebuffer_ = VK_NULL_HANDLE;
+            }
+            if (imageView_ != VK_NULL_HANDLE) {
+                vkDestroyImageView(device_, imageView_, nullptr);
+                imageView_ = VK_NULL_HANDLE;
+            }
+            if (renderPass_ != VK_NULL_HANDLE) {
+                vkDestroyRenderPass(device_, renderPass_, nullptr);
+                renderPass_ = VK_NULL_HANDLE;
+            }
             if (offscreenImage_ != VK_NULL_HANDLE) {
                 vkDestroyImage(device_, offscreenImage_, nullptr);
                 offscreenImage_ = VK_NULL_HANDLE;
@@ -389,7 +370,6 @@ public:
         physicalDevice_ = VK_NULL_HANDLE;
         images_.clear();
         imageLayouts_.clear();
-        offscreenInitialized_ = false;
         status_ = "STOPPED";
     }
 
@@ -436,7 +416,8 @@ private:
 
         for (VkPhysicalDevice candidate : devices) {
             uint32_t extensionCount = 0;
-            vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, nullptr);
+            vkEnumerateDeviceExtensionProperties(
+                candidate, nullptr, &extensionCount, nullptr);
             std::vector<VkExtensionProperties> extensions(extensionCount);
             vkEnumerateDeviceExtensionProperties(
                 candidate, nullptr, &extensionCount, extensions.data());
@@ -453,12 +434,11 @@ private:
             uint32_t familyCount = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(candidate, &familyCount, nullptr);
             std::vector<VkQueueFamilyProperties> families(familyCount);
-            vkGetPhysicalDeviceQueueFamilyProperties(candidate, &familyCount, families.data());
+            vkGetPhysicalDeviceQueueFamilyProperties(
+                candidate, &familyCount, families.data());
 
             for (uint32_t i = 0; i < familyCount; ++i) {
-                if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) {
-                    continue;
-                }
+                if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) continue;
 
                 VkBool32 canPresent = VK_FALSE;
                 result = vkGetPhysicalDeviceSurfaceSupportKHR(
@@ -546,7 +526,9 @@ private:
             vkGetPhysicalDeviceFormatProperties(
                 physicalDevice_, candidateFormat, &formatProperties);
             const VkFormatFeatureFlags required =
-                VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                VK_FORMAT_FEATURE_BLIT_DST_BIT;
 
             if ((formatProperties.optimalTilingFeatures & required) == required) {
                 surfaceFormat_ = candidate;
@@ -562,7 +544,7 @@ private:
         }
 
         if (!foundFormat) {
-            status_ = "ERROR: No surface format supports Vulkan blit source and destination.";
+            status_ = "ERROR: No surface format supports triangle rendering and image blit.";
             return false;
         }
 
@@ -667,7 +649,8 @@ private:
         imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        imageInfo.usage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -706,6 +689,269 @@ private:
             status_ = "ERROR: Binding offscreen image memory failed: " + vkResultName(result);
             return false;
         }
+
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = offscreenImage_;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = surfaceFormat_.format;
+        viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        result = vkCreateImageView(device_, &viewInfo, nullptr, &imageView_);
+        if (result != VK_SUCCESS) {
+            status_ = "ERROR: Creating offscreen image view failed: " + vkResultName(result);
+            return false;
+        }
+        return true;
+    }
+
+    bool createRenderPassAndFramebuffer() {
+        VkAttachmentDescription colorAttachment{};
+        colorAttachment.format = surfaceFormat_.format;
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+        VkAttachmentReference colorReference{};
+        colorReference.attachment = 0;
+        colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorReference;
+
+        VkSubpassDependency dependencies[2]{};
+        dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependencies[0].dstSubpass = 0;
+        dependencies[0].srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependencies[0].srcAccessMask = 0;
+        dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+        dependencies[1].srcSubpass = 0;
+        dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependencies[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependencies[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+        VkRenderPassCreateInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = 1;
+        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.subpassCount = 1;
+        renderPassInfo.pSubpasses = &subpass;
+        renderPassInfo.dependencyCount = 2;
+        renderPassInfo.pDependencies = dependencies;
+
+        VkResult result = vkCreateRenderPass(
+            device_, &renderPassInfo, nullptr, &renderPass_);
+        if (result != VK_SUCCESS) {
+            status_ = "ERROR: Creating render pass failed: " + vkResultName(result);
+            return false;
+        }
+
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = renderPass_;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = &imageView_;
+        framebufferInfo.width = offscreenExtent_.width;
+        framebufferInfo.height = offscreenExtent_.height;
+        framebufferInfo.layers = 1;
+
+        result = vkCreateFramebuffer(
+            device_, &framebufferInfo, nullptr, &framebuffer_);
+        if (result != VK_SUCCESS) {
+            status_ = "ERROR: Creating offscreen framebuffer failed: " + vkResultName(result);
+            return false;
+        }
+        return true;
+    }
+
+    bool readShaderAsset(
+            AAssetManager* manager,
+            const char* path,
+            std::vector<uint32_t>& words) {
+        AAsset* asset = AAssetManager_open(manager, path, AASSET_MODE_BUFFER);
+        if (asset == nullptr) {
+            status_ = std::string("ERROR: Could not open shader asset: ") + path;
+            return false;
+        }
+
+        const off_t length = AAsset_getLength(asset);
+        if (length <= 0 || (length % 4) != 0) {
+            AAsset_close(asset);
+            status_ = std::string("ERROR: Invalid SPIR-V shader length: ") + path;
+            return false;
+        }
+
+        words.resize(static_cast<size_t>(length) / sizeof(uint32_t));
+        const int bytesRead = AAsset_read(asset, words.data(), static_cast<size_t>(length));
+        AAsset_close(asset);
+
+        if (bytesRead != length) {
+            status_ = std::string("ERROR: Could not read complete SPIR-V shader: ") + path;
+            return false;
+        }
+        return true;
+    }
+
+    bool createShaderModule(
+            const std::vector<uint32_t>& words,
+            VkShaderModule* module) {
+        VkShaderModuleCreateInfo shaderInfo{};
+        shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        shaderInfo.codeSize = words.size() * sizeof(uint32_t);
+        shaderInfo.pCode = words.data();
+
+        VkResult result = vkCreateShaderModule(
+            device_, &shaderInfo, nullptr, module);
+        if (result != VK_SUCCESS) {
+            status_ = "ERROR: Creating shader module failed: " + vkResultName(result);
+            return false;
+        }
+        return true;
+    }
+
+    bool createGraphicsPipeline(AAssetManager* assetManager) {
+        std::vector<uint32_t> vertexWords;
+        std::vector<uint32_t> fragmentWords;
+
+        if (!readShaderAsset(assetManager, "shaders/triangle.vert.spv", vertexWords)) {
+            return false;
+        }
+        if (!readShaderAsset(assetManager, "shaders/triangle.frag.spv", fragmentWords)) {
+            return false;
+        }
+
+        VkShaderModule vertexModule = VK_NULL_HANDLE;
+        VkShaderModule fragmentModule = VK_NULL_HANDLE;
+
+        if (!createShaderModule(vertexWords, &vertexModule)) return false;
+        if (!createShaderModule(fragmentWords, &fragmentModule)) {
+            vkDestroyShaderModule(device_, vertexModule, nullptr);
+            return false;
+        }
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vertexModule;
+        stages[0].pName = "main";
+
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = fragmentModule;
+        stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vertexInput{};
+        vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+        VkViewport viewport{};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = static_cast<float>(offscreenExtent_.width);
+        viewport.height = static_cast<float>(offscreenExtent_.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+
+        VkRect2D scissor{};
+        scissor.offset = {0, 0};
+        scissor.extent = offscreenExtent_;
+
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.pViewports = &viewport;
+        viewportState.scissorCount = 1;
+        viewportState.pScissors = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.depthClampEnable = VK_FALSE;
+        rasterizer.rasterizerDiscardEnable = VK_FALSE;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode = VK_CULL_MODE_NONE;
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.depthBiasEnable = VK_FALSE;
+        rasterizer.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisampling{};
+        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisampling.sampleShadingEnable = VK_FALSE;
+
+        VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+        colorBlendAttachment.blendEnable = VK_FALSE;
+        colorBlendAttachment.colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT |
+            VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT |
+            VK_COLOR_COMPONENT_A_BIT;
+
+        VkPipelineColorBlendStateCreateInfo colorBlending{};
+        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.logicOpEnable = VK_FALSE;
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &colorBlendAttachment;
+
+        VkPipelineLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+
+        VkResult result = vkCreatePipelineLayout(
+            device_, &layoutInfo, nullptr, &pipelineLayout_);
+        if (result != VK_SUCCESS) {
+            vkDestroyShaderModule(device_, fragmentModule, nullptr);
+            vkDestroyShaderModule(device_, vertexModule, nullptr);
+            status_ = "ERROR: Creating graphics pipeline layout failed: " + vkResultName(result);
+            return false;
+        }
+
+        VkGraphicsPipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = stages;
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pColorBlendState = &colorBlending;
+        pipelineInfo.layout = pipelineLayout_;
+        pipelineInfo.renderPass = renderPass_;
+        pipelineInfo.subpass = 0;
+
+        result = vkCreateGraphicsPipelines(
+            device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline_);
+
+        vkDestroyShaderModule(device_, fragmentModule, nullptr);
+        vkDestroyShaderModule(device_, vertexModule, nullptr);
+
+        if (result != VK_SUCCESS) {
+            status_ = "ERROR: Creating graphics pipeline failed: " + vkResultName(result);
+            return false;
+        }
         return true;
     }
 
@@ -735,7 +981,8 @@ private:
 
         VkSemaphoreCreateInfo semaphoreInfo{};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        result = vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailable_);
+        result = vkCreateSemaphore(
+            device_, &semaphoreInfo, nullptr, &imageAvailable_);
         if (result != VK_SUCCESS) {
             status_ = "ERROR: Could not create image-available semaphore: " + vkResultName(result);
             return false;
@@ -752,7 +999,8 @@ private:
         VkFenceCreateInfo fenceInfo{};
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        result = vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFence_);
+        result = vkCreateFence(
+            device_, &fenceInfo, nullptr, &inFlightFence_);
         if (result != VK_SUCCESS) {
             status_ = "ERROR: Could not create frame fence: " + vkResultName(result);
             return false;
@@ -778,8 +1026,12 @@ private:
 
     VkImage offscreenImage_ = VK_NULL_HANDLE;
     VkDeviceMemory offscreenMemory_ = VK_NULL_HANDLE;
+    VkImageView imageView_ = VK_NULL_HANDLE;
     VkExtent2D offscreenExtent_{};
-    bool offscreenInitialized_ = false;
+    VkRenderPass renderPass_ = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline graphicsPipeline_ = VK_NULL_HANDLE;
     VkFilter blitFilter_ = VK_FILTER_NEAREST;
 
     std::vector<VkSemaphore> renderFinished_;
@@ -796,9 +1048,12 @@ static std::unique_ptr<VulkanRenderer> gRenderer;
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_devdgames_sixsevenframes_MainActivity_nativeStart(
-    JNIEnv* env, jobject /* thiz */, jobject surface) {
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject surface,
+    jobject assetManager) {
     gRenderer = std::make_unique<VulkanRenderer>();
-    const std::string status = gRenderer->start(env, surface);
+    const std::string status = gRenderer->start(env, surface, assetManager);
     return env->NewStringUTF(status.c_str());
 }
 
