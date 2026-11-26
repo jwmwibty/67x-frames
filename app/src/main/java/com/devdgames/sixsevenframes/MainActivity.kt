@@ -1,6 +1,7 @@
 package com.devdgames.sixsevenframes
 
 import android.app.Activity
+import android.content.res.AssetManager
 import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
@@ -17,7 +18,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    private external fun nativeStart(surface: Surface): String
+    private external fun nativeStart(surface: Surface, assets: AssetManager): String
     private external fun nativeDrawFrame(): Boolean
     private external fun nativeLastStatus(): String
     private external fun nativeStop()
@@ -78,7 +79,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             return
         }
 
-        val result = nativeStart(holder.surface)
+        val result = nativeStart(holder.surface, assets)
         statusView.text = result
 
         if (result.startsWith("READY")) {
